@@ -3,16 +3,21 @@ import torch
 import sqlite3
 import io
 
+# Sets the device to be used to cuda if it is available, otherwise everything will be done on CPU
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def create_table(conn):
+    """
+    Creates a .db for the test cases.
+    Stores the ID, the test case, the model used for embedding and the embedding itself.
+    """
     c = conn.cursor()
     c.execute(
         '''
         CREATE TABLE IF NOT EXISTS entries (
             id TEXT PRIMARY KEY,
-            title TEXT,
-            description TEXT,
-            test_steps TEXT,
+            test_case TEXT,
             model TEXT,
             embedding BLOB
         )
@@ -21,9 +26,18 @@ def create_table(conn):
     conn.commit()
 
 
-def compute_embedding(entry):
-    id, title, description, test_steps, model = entry
-    input_text = [f"Name: {title}\n\nDescription: {description}\n\nTest Steps: {test_steps}"]
+def format_test_case(title: str, description: str, test_steps: str) -> str:
+    """
+    Formats a test case in accordance to a certain template. The output is a list with 1 element ready for Ollama.
+    """
+    return f"Title: {title}\n\nDescription: {description}\n\nTest Steps: {test_steps}"
+
+
+def calculate_embedding(formatted_tc: str, model: str) -> torch.Tensor:
+    """
+    Calculates the embedding for a curated test case and returns the embedding for it.
+    """
+    input_text = [formatted_tc]
     responses = ollama.embed(model=model, input=input_text)
     embeddings = responses["embeddings"]
     embed_tensor = torch.tensor(embeddings).squeeze()
@@ -31,56 +45,72 @@ def compute_embedding(entry):
 
 
 def serialize_tensor(tensor):
+    """
+    Serializes the embedding tensor to be stored in the database.
+    """
     buffer = io.BytesIO()
     torch.save(tensor, buffer)
     return buffer.getvalue()
 
 
 def deserialize_tensor(blob):
+    """
+    Deserializes the embedding tensor to be retrieved from the database
+    """
     buffer = io.BytesIO(blob)
     return torch.load(buffer)
 
 
 def get_entry_by_id(conn, entry_id):
+    """
+    Returns everything about a test case based on the ID.
+    """
     c = conn.cursor()
     c.execute("SELECT * FROM entries WHERE id = ?", (entry_id,))
     return c.fetchone()
 
 
-def is_entry_different(existing_entry, new_entry):
-    id, title, description, test_steps, model, blob = existing_entry
-    n_id, n_title, n_description, n_test_steps, n_model = new_entry
-    return (title != n_title or
-            description != n_description or
-            test_steps != n_test_steps or
-            model != n_model)
+def is_entry_different(existing_entry, new_test_case, new_model):
+    """
+    Checks if the existing test case entry is different from the proposed one.
+    Returns either True or False.
+    """
+    id, test_case, model, blob = existing_entry
+    return (test_case != new_test_case) or (model != new_model)
 
 
-def add_entry(conn, entry):
-    id, title, description, test_steps, model = entry
-    embedding = compute_embedding(entry)
+def add_entry(conn, id, formatted_tc, model):
+    """
+    Adds an entry to the database.
+    """
+    embedding = calculate_embedding(formatted_tc, model)
     embedding_blob = serialize_tensor(embedding)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO entries (id, title, description, test_steps, model, embedding) VALUES (?, ?, ?, ?, ?, ?)",
-        (id, title, description, test_steps, model, embedding_blob)
+        "INSERT INTO entries (id, test_case, model, embedding) VALUES (?, ?, ?, ?)",
+        (id, formatted_tc, model, embedding_blob)
     )
     conn.commit()
 
 
-def update_entry(conn, entry):
-    id, title, description, test_steps, model = entry
-    embedding = compute_embedding(entry)
+def update_entry(conn, id, new_tc, new_model):
+    """
+    Updates an entry in the database.
+    """
+    embedding = calculate_embedding(new_tc, new_model)
     embedding_blob = serialize_tensor(embedding)
     c = conn.cursor()
     c.execute(
-        "UPDATE entries SET title = ?, description = ?, test_steps = ?, model = ?, embedding = ? WHERE id = ?",
-        (title, description, test_steps, model, embedding_blob, id)
+        "UPDATE entries SET test_case = ?, model = ?, embedding = ? WHERE id = ?",
+        (new_tc, new_model, embedding_blob, id)
     )
     conn.commit()
 
 
 def get_embeddings_by_ids(conn, id_list):
+    """
+    Returns a list of tuples (ID, embedding) based on a list of IDs
+    """
     c = conn.cursor()
     placeholders = ', '.join('?' for _ in id_list)
     query = f"SELECT id, embedding FROM entries WHERE id IN ({placeholders})"
@@ -90,27 +120,24 @@ def get_embeddings_by_ids(conn, id_list):
     for row in c.fetchall():
         entry_id, blob = row
         embedding = deserialize_tensor(blob)
-        result_map[entry_id]=embedding
+        result_map[entry_id] = embedding
     results = []
     for id in id_list:
         results.append((id, result_map[id]))
     return results
 
-    # results = []
-    # for row in c.fetchall():
-    #     entry_id, blob = row
-    #     embedding = deserialize_tensor(blob)
-    #     results.append((entry_id, embedding))
-    # return results
-    #
 
-def get_filtered_similarity_matrix(embed_tensor, block_size, similarity_index):
-    # print(f"PURR 63866 emb {embed_tensor[63866]}")
-    # print(f"PURR 64141 emb {embed_tensor[64141]}")
-
+def get_filtered_similarity_matrix(embed_tensor, block_size, similarity_coefficient):
+    """
+    Does matrix multiplication by blocks and filters the results to return a list of tuples (s, i, j)
+    which means that index i is similar to index j by a coefficient of s which is guaranteed to be over the
+    similarity_coefficient.
+    """
+    # Hyperparameters for later
     num_embeds = embed_tensor.size(0)
     embed_size = embed_tensor.size(1)
 
+    # Calculates the necessary number of blocks to cover the number of elements
     num_blocks = num_embeds // block_size + (1 if num_embeds % block_size else 0)
 
     filtered_list = []
@@ -122,37 +149,30 @@ def get_filtered_similarity_matrix(embed_tensor, block_size, similarity_index):
         for j in range(num_blocks):
             j_start = j * block_size
             j_end = min((j + 1) * block_size, num_embeds)
-            i_block = embed_tensor[i_start:i_end, :].to("cuda")
-            j_block = embed_tensor[j_start:j_end, :].to("cuda")
+
+            # Creates a new tensor based on the current coordinates to calculate stuff by blocks
+            i_block = embed_tensor[i_start:i_end, :].to(device)
+            j_block = embed_tensor[j_start:j_end, :].to(device)
+
+            # Does matrix multiplication such that coordinates ij show how similar i is to j
             matrix = torch.matmul(i_block, j_block.T)
 
-            # magic_i = 63866
-            # magic_j = 64141
+            # Filters the matrix out so that all values less than the similarity coefficient get turned to 0
+            matrix[matrix < similarity_coefficient] = 0
 
-            # if i_start<=magic_i<i_end and j_start<=magic_j<j_end:
-            #     print(f"PURR {matrix[magic_j-i_start][magic_i-j_start]}")
-
-            # print(f"base matrix")
-            # print(matrix)
-            matrix[matrix < similarity_index] = 0
-            # print(f"zerod matrix")
-            # print(matrix)
-
-            # Create a mask that only keeps entries where the global row index < global column index.
-            global_rows = torch.arange(i_start, i_end, device="cuda").unsqueeze(1)  # shape (block_rows, 1)
-            global_cols = torch.arange(j_start, j_end, device="cuda").unsqueeze(0)  # shape (1, block_cols)
+            # Creates a mask to remove duplicates and self references by masking the lower triangle of the global matrix
+            global_rows = torch.arange(i_start, i_end, device=device).unsqueeze(1)  # shape (block_rows, 1)
+            global_cols = torch.arange(j_start, j_end, device=device).unsqueeze(0)  # shape (1, block_cols)
             upper_mask = global_rows < global_cols
-            # print(upper_mask)
-            # Combine with the nonzero (above-threshold) condition.
-            valid_mask = (matrix != 0) & upper_mask
-            # print(f"valid mask")
-            # print(valid_mask)
 
-            # Retrieve indices and values where valid_mask is True.
+            # Keeps only the values that fulfill the upper triangle and over the similarity coefficient
+            valid_mask = (matrix != 0) & upper_mask
+
+            # Retrieve indices and values where valid_mask is True
             nonzero_indices = torch.nonzero(valid_mask, as_tuple=False)
-            # print(nonzero_indices)
             scores = matrix[valid_mask]
 
+            # Iterates over the indices and turns them to coordinates
             for k in range(nonzero_indices.shape[0]):
                 r, c = nonzero_indices[k]
                 global_row = i_start + r.item()
@@ -185,19 +205,22 @@ class UnionFind:
 
 
 def transitive_closure(edges):
+    """
+    Uses transitive closure to return a list of sets of duplicates.
+    """
     uf = UnionFind()
-    # Process each edge to union the nodes.
+    # Process each edge to union the nodes
     for _, i, j in edges:
         uf.union(i, j)
 
-    # Group all nodes by their root.
+    # Group all nodes by their root
     components = {}
-    # Make sure to consider all nodes in edges.
+    # Make sure to consider all nodes in edges
     for _, i, j in edges:
         root_i = uf.find(i)
         root_j = uf.find(j)
         components.setdefault(root_i, set()).update([i, j])
-        # The above also ensures both i and j are in the same component.
+        # The above also ensures both i and j are in the same component
 
     return list(components.values())
 
@@ -205,29 +228,20 @@ def transitive_closure(edges):
 import os
 import csv
 
-def save_graph_csv(edges: list, name):
+
+def save_graph_csv(edges: list, name: str):
     """
-    Expects edges to be a list of tuples (w, i, j), where w is the edge weight, and i and j are the node IDs
-    Saves the edges list as a CSV file with the given name under filtered_Data/csv_files/
+    Saves a CSV file of the edges to be used for Gephi.
     """
-    # Define the directory where the CSV files will be saved
     output_dir = "filtered_Data/csv_files"
-    
-    # Ensure the directory exists
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Construct the full path for the CSV file
     csv_file_path = os.path.join(output_dir, f"{name}.csv")
-    
-    # Write the edges to a CSV file
+
     with open(csv_file_path, mode='w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        
-        # Write the header row
         writer.writerow(['Weight', 'Source', 'Target'])
-        
-        # Write each edge as a row in the CSV file
+
         for w, i, j in edges:
             writer.writerow([w, i, j])
 
-    print(f"CSV file saved to {csv_file_path}")
+    print(f"\tCSV edges file for Gephi saved")
